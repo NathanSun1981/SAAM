@@ -14,7 +14,7 @@ from configs.cityscapes_id2label import CONFIG as CONFIG_CITYSCAPES_ID2LABEL
 from configs.coco_id2label import CONFIG as CONFIG_COCO_ID2LABLE
 
 import mmcv
-from mmdet.core.visualization.image import draw_masks, get_palette, palette_val, draw_bboxes, draw_labels, _get_adaptive_scales, get_palette
+from mmdet.core.visualization.image import draw_masks, get_palette, palette_val, draw_bboxes, draw_labels, _get_adaptive_scales
 from mmdet.core.mask.structures import bitmap_to_polygon
 import numpy as np
 import pycocotools.mask as maskUtils
@@ -22,163 +22,51 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Polygon
 
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
 import time
 from config import ConfigParser
 import dense_slam
 import glob
 
-from ultralytics import YOLO
-
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12355'
 
 EPS = 1e-2
 
 
-
-def show_mask(mask, ax, random_color=False):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([30/255, 144/255, 255/255, 0.6])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
-    
-def show_points(coords, labels, ax, marker_size=375):
-    pos_points = coords[labels==1]
-    neg_points = coords[labels==0]
-    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
-    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
-    
-def show_box(box, ax):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2)) 
-    
-def show_anns(anns):
-    if len(anns) == 0:
-        return
-    sorted_anns = sorted(anns, key=(lambda x: x['area']), reverse=True)
-    ax = plt.gca()
-    ax.set_autoscale_on(False)
-
-    img = np.ones((sorted_anns[0]['segmentation'].shape[0], sorted_anns[0]['segmentation'].shape[1], 4))
-    img[:,:,3] = 0
-    for ann in sorted_anns:
-        m = ann['segmentation']
-        color_mask = np.concatenate([np.random.random(3), [0.35]])
-        img[m] = color_mask
-    ax.imshow(img)
-    
-
-
-def segformer_segmentation(image, processor, model):
+def segformer_segmentation(image, processor, model,rank):
     h, w, _ = image.shape
-    inputs = processor(images=image, return_tensors="pt")
+    inputs = processor(images=image, return_tensors="pt").to(rank)
     outputs = model(**inputs)
     logits = outputs.logits
     logits = F.interpolate(logits, size=(h, w), mode='bilinear', align_corners=True)
     predicted_semantic_map = logits.argmax(dim=1).squeeze(0)
     return predicted_semantic_map
 
-def oneformer_coco_segmentation(image, oneformer_coco_processor, oneformer_coco_model):
-    inputs = oneformer_coco_processor(images=image, task_inputs=["semantic"], return_tensors="pt")
+def oneformer_coco_segmentation(image, oneformer_coco_processor, oneformer_coco_model, rank):
+    inputs = oneformer_coco_processor(images=image, task_inputs=["semantic"], return_tensors="pt").to(rank)
     outputs = oneformer_coco_model(**inputs)
     predicted_semantic_map = oneformer_coco_processor.post_process_semantic_segmentation(
         outputs, target_sizes=[image.size[::-1]])[0]
     return predicted_semantic_map
 
-def oneformer_ade20k_segmentation(image, oneformer_ade20k_processor, oneformer_ade20k_model):
-    inputs = oneformer_ade20k_processor(images=image, task_inputs=["semantic"], return_tensors="pt")
+def oneformer_ade20k_segmentation(image, oneformer_ade20k_processor, oneformer_ade20k_model, rank):
+    inputs = oneformer_ade20k_processor(images=image, task_inputs=["semantic"], return_tensors="pt").to(rank)
     outputs = oneformer_ade20k_model(**inputs)
     predicted_semantic_map = oneformer_ade20k_processor.post_process_semantic_segmentation(
         outputs, target_sizes=[image.size[::-1]])[0]
     return predicted_semantic_map
 
-def oneformer_cityscapes_segmentation(image, oneformer_cityscapes_processor, oneformer_cityscapes_model):
-    inputs = oneformer_cityscapes_processor(images=image, task_inputs=["semantic"], return_tensors="pt")
+def oneformer_cityscapes_segmentation(image, oneformer_cityscapes_processor, oneformer_cityscapes_model, rank):
+    inputs = oneformer_cityscapes_processor(images=image, task_inputs=["semantic"], return_tensors="pt").to(rank)
     outputs = oneformer_cityscapes_model(**inputs)
     predicted_semantic_map = oneformer_cityscapes_processor.post_process_semantic_segmentation(
         outputs, target_sizes=[image.size[::-1]])[0]
     return predicted_semantic_map
 
-def yolo_segmentation(img, yolo_model, masked_color=None):
-    #start yolo predict
-    t = time.time()
-    results = yolo_model.predict(source=img)   
-    print("Yolo preducit Elapse {} s, counts of results = {}".format((time.time()-t), len(results)))
-      
-    result = results[0]
-    
-    boxes = result.boxes
-    labels = boxes.cls
-    print(boxes.cls)
-    masks = result.masks.data
-    #show_mask(masks, plt.gca(), True)   
-    masks = np.array(masks.tolist()).astype(int)  
-    
-         
-    img0 = mmcv.imread(img).astype(np.uint8)
-    img0 = mmcv.bgr2rgb(img0)
-    img0 = np.ascontiguousarray(img0)  
-    mask_palette = get_palette(masked_color, len(labels))   
-    colors = [mask_palette[i] for i in range(len(labels))]
-    colors = np.array(colors, dtype=np.uint8)
-    
-    h, w, _ = img0.shape
-    
-    """ fig = plt.figure()
-    ax = fig.add_axes([0,0,1,1])
-    ax.axis('off') 
-    plt.imshow(img0)
-    _, _img = draw_masks(ax,img=img0,masks=masks,color = colors, alpha=0.5)
-    plt.imshow(_img)
-    plt.show()  """   
-    
-    labled_mask = np.zeros([h,w])
-    binary_mask = np.zeros([h,w])
-        
-    for mask, bbox, cls in zip(masks, boxes.xyxy.tolist(), boxes.cls):
-        input_box = np.array(bbox)
-        
-        """ masks, _, _ = predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=input_box[None, :],
-            multimask_output=False,
-        ) """
-        real_mask = mask - binary_mask
-        real_mask = np.where(real_mask > 0, real_mask, 0)
-        #binary_mask = real_mask + binary_mask
-        #print(np.unique(real_mask))
-        #print(np.unique(binary_mask))
-        
-        labled_mask = np.where(labled_mask > 0, labled_mask, real_mask * int(cls))
-        
-        #labled_mask += real_mask * int(cls)
-                    
-        #for i, (mask, score) in enumerate(masks, scores)):
-        #plt.figure()
-        #plt.imshow(img)
-        #show_mask(mask, plt.gca(), True)
-        #show_box(input_box, plt.gca())
-        #plt.title(f"Mask {i+1}, Score: {score:.3f}", fontsize=18)
-        #plt.axis('off')
-        #plt.show() 
-    
-        segmentation_mask = mask
-        binary_mask = np.where(segmentation_mask > 0.5, 1, 0)
-
-        white_background = np.ones_like(img) * 255
-        new_image = white_background * (1 - binary_mask[..., np.newaxis]) + img * binary_mask[..., np.newaxis]
-        #plt.imshow(new_image.astype(np.uint8))
-        #plt.axis('off')
-        #plt.show()
-            
-    print(labled_mask.shape)
-    print(np.unique(labled_mask))   
-    
-    class_ids = torch.tensor(labled_mask.astype(int))
-    return class_ids
 
 oneformer_func = {
     'ade20k': oneformer_ade20k_segmentation,
@@ -210,10 +98,10 @@ def draw_only_masks(ax, img, depth, masks):
         tmp = {}
         for v in mask_tmp:
             tmp[v] = np.sum(masked_img == v)
-        print("mask值为：")
+        """ print("mask value：")
         print(mask_tmp)
-        print("统计结果：")
-        print(tmp)
+        print("sum：")
+        print(tmp) """
     white_background = np.ones_like(img) * 255    
     img = white_background * (1 - masked_img[..., np.newaxis]) + img * masked_img[..., np.newaxis]
     depth = depth * masked_img[..., np.newaxis]
@@ -421,7 +309,7 @@ def imshow_det_bboxes(img,
     return img
 
 
-def segmentor_inference(filename, color_output_path, depth_output_path, img=None, depth=None, save_img=False, classes = None,
+def segmentor_inference(filename, color_output_path, depth_output_path, rank=None, img=None, depth=None, classes = None,
                                  semantic_branch_processor=None,
                                  semantic_branch_model=None,
                                  mask_branch_model=None,
@@ -444,14 +332,9 @@ def segmentor_inference(filename, color_output_path, depth_output_path, img=None
     print("run on model", model)
     if model == 'oneformer':
         class_ids = oneformer_func[dataset](Image.fromarray(img), semantic_branch_processor,
-                                                                        semantic_branch_model)
+                                                                        semantic_branch_model, rank)
     elif model == 'segformer':
-        class_ids = segformer_segmentation(img, semantic_branch_processor, semantic_branch_model)   
-    
-    elif model == 'yolo':
-        class_ids = yolo_segmentation(img, semantic_branch_model)
-        
-         
+        class_ids = segformer_segmentation(img, semantic_branch_processor, semantic_branch_model, rank)    
     else:
         raise NotImplementedError()
 
@@ -499,34 +382,38 @@ def segmentor_inference(filename, color_output_path, depth_output_path, img=None
         anns['semantic_mask'][str(sematic_class_in_img[i].item())]['counts'] = anns['semantic_mask'][str(sematic_class_in_img[i].item())]['counts'].decode('utf-8')
     
     print("Create Semantic Masks Elapse {} s".format(time.time()-t))
-    if save_img:       
-        """ if use_sam:
-            filename = filename + '_' + 'withSAM'
-        else:
-            filename = filename + '_' + 'withoutSAM' """
         
-        imshow_det_bboxes(img, depth,
-                            bboxes=None,
-                            labels=np.arange(len(sematic_class_in_img)),
-                            sematic_classes = np.array(sematic_class_in_img),
-                            segms=np.stack(semantic_bitmasks),
-                            class_names=semantic_class_names,
-                            font_size=25,
-                            show=False,
-                            classes = classes,
-                            draw_label=False,
-                            color_out_file=os.path.join(color_output_path, filename + '.png'),
-                            depth_out_file=os.path.join(depth_output_path, filename + '.png'))
+    imshow_det_bboxes(img, depth,
+                    bboxes=None,
+                    labels=np.arange(len(sematic_class_in_img)),
+                    sematic_classes = np.array(sematic_class_in_img.cpu().numpy()),
+                    segms=np.stack(semantic_bitmasks),
+                    class_names=semantic_class_names,
+                    font_size=25,
+                    show=False,
+                    classes = classes,
+                    draw_label=False,
+                    color_out_file=os.path.join(color_output_path, filename + '.png'),
+                    depth_out_file=os.path.join(depth_output_path, filename + '.png'))
 
-        print('save predictions to ', os.path.join(color_output_path, filename + '.png'))
+    print('save predictions to ', os.path.join(color_output_path, filename + '.png'))
     #mmcv.dump(anns, os.path.join(output_path, dataset + '_' + model + '_' + filename + '_semantic.json'))
+    del img
+    del anns
+    del class_ids
+    del semantc_mask
+    del class_names
+    del semantic_bitmasks
+    del semantic_class_names
     
-def main(args): 
+def main(rank, args): 
     #generate SAM masks
-    #print(args)
-
-    sam = sam_model_registry[args.sam_model_type](checkpoint=args.ckpt_path)
-    _ = sam.to(device=(args.sam_device))
+    #print(rank, args.num_gpus)
+    
+    dist.init_process_group("nccl", rank=rank, world_size=args.num_gpus)
+    
+    sam = sam_model_registry[args.sam_model_type](checkpoint=args.ckpt_path).to(rank)
+    #_ = sam.to(device=args.device)
 
     mask_branch_model = SamAutomaticMaskGenerator(
         model=sam,
@@ -545,17 +432,17 @@ def main(args):
             semantic_branch_processor = OneFormerProcessor.from_pretrained(
                 "shi-labs/oneformer_ade20k_swin_large")
             semantic_branch_model = OneFormerForUniversalSegmentation.from_pretrained(
-                "shi-labs/oneformer_ade20k_swin_large")
+                "shi-labs/oneformer_ade20k_swin_large").to(rank)
         elif args.dataset == 'cityscapes':
             semantic_branch_processor = OneFormerProcessor.from_pretrained(
                 "shi-labs/oneformer_cityscapes_swin_large")
             semantic_branch_model = OneFormerForUniversalSegmentation.from_pretrained(
-                "shi-labs/oneformer_cityscapes_swin_large")
+                "shi-labs/oneformer_cityscapes_swin_large").to(rank)
         elif args.dataset == 'coco':
             semantic_branch_processor = OneFormerProcessor.from_pretrained(
                 "shi-labs/oneformer_coco_swin_large")
             semantic_branch_model = OneFormerForUniversalSegmentation.from_pretrained(
-                "shi-labs/oneformer_coco_swin_large")
+                "shi-labs/oneformer_coco_swin_large").to(rank)
         else:
             raise NotImplementedError()
     elif args.seg_model == 'segformer':
@@ -564,26 +451,22 @@ def main(args):
             semantic_branch_processor = SegformerFeatureExtractor.from_pretrained(
                 "nvidia/segformer-b5-finetuned-ade-640-640")
             semantic_branch_model = SegformerForSemanticSegmentation.from_pretrained(
-                "nvidia/segformer-b5-finetuned-ade-640-640")
+                "nvidia/segformer-b5-finetuned-ade-640-640").to(rank)
         elif args.dataset == 'cityscapes':
             semantic_branch_processor = SegformerFeatureExtractor.from_pretrained(
                 "nvidia/segformer-b5-finetuned-cityscapes-1024-1024")
             semantic_branch_model = SegformerForSemanticSegmentation.from_pretrained(
-                "nvidia/segformer-b5-finetuned-cityscapes-1024-1024")
+                "nvidia/segformer-b5-finetuned-cityscapes-1024-1024").to(rank)
         else:
-            raise NotImplementedError()    
-    elif args.seg_model == 'yolo':
-        semantic_branch_processor = None
-        semantic_branch_model = YOLO(args.ckpt_yolo)
-        
+            raise NotImplementedError()      
     else:
         raise NotImplementedError()
     print('Semantic Segmentor is loaded.')
     
     ext = args.file_suffix
     # Check if the file with current extension exists
-
-    local_filenames = [fn_.replace(ext, '') for fn_ in os.listdir(args.color_dir) if ext in fn_]
+    filenames = [fn_.replace(ext, '') for fn_ in os.listdir(args.color_dir) if ext in fn_]    
+    local_filenames = filenames[(len(filenames) // args.num_gpus + 1) * rank : (len(filenames) // args.num_gpus + 1) * (rank + 1)]
         
     #print(local_filenames)
     print('Images Loaded')
@@ -591,7 +474,7 @@ def main(args):
 
     for i, file_name in enumerate(local_filenames):
         t = time.time()
-        print('Processing ', i + 1 , '/', len(local_filenames), ' ', file_name+ext)
+        print('Processing ', i + 1 , '/', len(local_filenames), ' ', file_name + ext, ' on rank ', rank, '/', args.num_gpus)
         img = mmcv.imread(os.path.join(args.color_dir, file_name+ext))
         depth_ref = np.array(o3d.t.io.read_image(os.path.join(args.depth_dir, file_name + '.png')))
         if args.dataset == 'ade20k':
@@ -605,7 +488,7 @@ def main(args):
         with torch.no_grad():
             # start to process segemtor
             segmentor_inference(file_name, os.path.join(args.path_dataset, args.color_folder), os.path.join(args.path_dataset, args.depth_folder),
-                                img=img, depth=depth_ref, save_img=args.save_img, classes= args.classes,
+                                rank=rank, img=img, depth=depth_ref, classes= args.classes,
                                 semantic_branch_processor=semantic_branch_processor,
                                 semantic_branch_model=semantic_branch_model,
                                 mask_branch_model=mask_branch_model,
@@ -615,15 +498,15 @@ def main(args):
                                 use_sam=args.using_sam,
                                 convert_to_rle = args.convert_to_rle)
         print("Totally Elapse {} s".format(time.time()-t))
-
+        
 def load_config():
     parser = ConfigParser()
     config = parser.get_config()
     
-    return config   
-    
+    return config  
+
 if __name__ == '__main__':
-    #load config for slam
+    
     args = load_config()
     #print(args)
     if not os.path.exists(os.path.join(args.path_dataset, args.color_folder)):
@@ -631,9 +514,14 @@ if __name__ == '__main__':
         
     files = glob.glob(os.path.join(args.path_dataset, args.color_folder, '*.png'))
     if len(files) > 0:
-        print("processed files exist!!!")  
-        #main(args)
-    else: 
-        main(args)
+        print("processed files exist!!!")        
+    else:
+        print(args)
+        if args.num_gpus > 1:
+            mp.spawn(main,args=(args,),nprocs=args.num_gpus,join=True)
+        else:
+            main(0, args)
+    
+    print("finish all image processing, start 3d reconstrution!")
         
     dense_slam.run_slam(args)

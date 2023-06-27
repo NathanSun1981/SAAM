@@ -275,7 +275,7 @@ def main(args):
     
     ext = args.file_suffix
     # Check if the file with current extension exists
-    local_filenames = [fn_.replace(ext, '') for fn_ in os.listdir(args.data_dir) if ext in fn_]
+    local_filenames = [fn_.replace(ext, '') for fn_ in os.listdir(args.color_dir) if ext in fn_]
         
     print(local_filenames)
     print('Images Loaded')
@@ -286,7 +286,7 @@ def main(args):
     for i, file_name in enumerate(local_filenames):
         t = time.time()
         print('Processing ', i + 1 , '/', len(local_filenames), ' ', file_name+ext)
-        img = mmcv.imread(os.path.join(args.data_dir, file_name+ext))
+        img = mmcv.imread(os.path.join(args.color_dir, file_name+ext))
         img0 = mmcv.bgr2rgb(img)
         with torch.no_grad():
             # start to process segemtor      
