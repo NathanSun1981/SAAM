@@ -22,9 +22,17 @@ mkdir ckp && cd ckp
 wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
 cd ..
 ```
+# Configuration
+all default configurations are stored in default_config.yml and config.py
+
 
 # RUN SAAM
 ```bash
-python scripts/sam_transfomer.py --data_dir data/room/ --out_dir output_room/ --seg_model oneformer --convert_to_rle --using_sam --classes 30 
+python scripts/sam_transfomer.py --data_dir data/room/  --seg_model oneformer --dataset ade20k --convert_to_rle --using_sam --classes 23 30 31
 ```
 you can choose which class  needs to be filtered out after segmenetation by setting '--classes'
+
+using pytorch multiprocessing using multiple GPUs 
+```bash
+python scripts/sam_transfomer_mp.py --data_dir data/room/  --seg_model oneformer --dataset ade20k --convert_to_rle --using_sam --classes 23 30 31 --num_gpus 3
+```
